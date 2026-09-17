@@ -24,6 +24,25 @@ and Figures `fig:strategybar`, `fig:ablation`).
   ablation. Produces `robustness_comparison.csv`, `ablation_standard.csv`,
   `ablation_low_consistency.csv`, `fig_robustness.png`, `fig_ablation.png`.
   → Table `tab:robustness`, Figure `fig:ablation`.
+- **`scale_experiment.py`** — exploratory, not part of the main pipeline.
+  Replicates each of the 15 personas into $N$ independent synthetic
+  analysts (same profile, independent draws) at $N \in \{1,3,10,30\}$ and
+  re-runs the own-only/others-only/similarity-only/hybrid ablation at
+  each scale. Answers "does more data (more analysts sharing the same 15
+  profiles) reverse the own-usage-dominance finding?" → no; the gap
+  narrows then plateaus. Self-contained; writes
+  `scale_experiment_results.csv`.
+- **`overlap_experiment.py`** — exploratory, not part of the main
+  pipeline. Builds four analyst "families" sharing a fixed fact and a
+  deliberately small, shared pool of candidate dimensions/measures, with
+  each analyst keeping a fixed personal subset of that pool (individual
+  self-consistency preserved) — a condition engineered to be maximally
+  favourable to collaborative filtering. Answers the same question under
+  a different, more favourable scale-up strategy → same conclusion.
+  Self-contained; writes `overlap_experiment_results.csv`.
+
+Both `tab:scaleup` values in the paper (Discussion, Section 7.1) come
+directly from these last two scripts' console/CSV output.
 
 ## Dependencies
 
