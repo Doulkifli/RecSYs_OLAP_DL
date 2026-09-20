@@ -1,9 +1,13 @@
 """
-Overlapping-personas experiment (follow-up to scale_experiment.py).
+overlap_experiment.py
+======================
+EXPLORATORY script, not part of the paper's main evaluation pipeline.
+Follow-up to scale_experiment.py.
 
 scale_experiment.py replicated each of the 15 *existing* personas into many
 copies -- same profile, independent draws. That narrowed but did not close
-the own-only vs. others-only gap, and it plateaued.
+the own-only vs. others-only gap, and it plateaued (see Table `tab:scaleup`,
+"Replicated personas" rows).
 
 This script instead builds a small number of "families" that share a fixed
 fact and a SMALL shared pool of candidate dimensions/measures/parameters.
@@ -11,7 +15,30 @@ Each family's analysts are independently random, but because the pool they
 draw from is small, distinct analysts frequently land on the exact same
 dimension/measure/parameter by chance -- genuine content overlap, not
 persona replication. This is the condition under which collaborative
-filtering is supposed to shine.
+filtering is supposed to shine: lots of DIFFERENT analysts converging on
+the SAME small set of items.
+
+RESULT (feeds the paper's Table `tab:scaleup`, "Shared small pool"
+rows): even in this deliberately favourable setup, others-only/
+popularity P@1 plateaus even LOWER (~0.35-0.37) than under plain
+persona replication (~0.51), because once many analysts share a small
+pool, item popularity becomes nearly uniform across that pool and
+loses discriminative power -- while each analyst's own repeated choice
+stays comparatively sharp. Own-history dominance is not reversed here
+either.
+
+DESIGN NOTE -- why two attempts were needed to get this right: an
+early version of this script made every session's dimension/measure
+choice fully independent (i.i.d. random each time), which accidentally
+destroyed each analyst's OWN self-consistency too, confounding the
+comparison (own-history looked artificially weak because it was
+effectively as random as everyone else's). THIS version fixes that: each
+analyst is assigned a FIXED personal subset of the shared family pool
+(my_dims / my_measures / my_params, chosen once, see
+generate_events_overlap below), preserving individual consistency,
+with only a modest amount of session-to-session exploration noise on
+top -- so the comparison actually isolates "cross-analyst overlap"
+from "individual consistency" instead of conflating the two.
 """
 import random, math, csv
 import numpy as np
@@ -21,12 +48,21 @@ K_VALUES = [1, 3, 5]
 STRATEGIES = ["random", "popularity", "own_only", "others_only", "similarity_only", "hybrid"]
 
 def dataset_of_attr(attr):
+    """Recover an attribute's owning dataset from its name prefix, same
+    convention as every other script in this package."""
     for d in DATASETS:
         if attr.startswith(d + "."):
             return d
     return None
 
 # Four shared-pool families: fixed fact, small shared dims/measures pools.
+# Every analyst spawned under a given family (see
+# generate_events_overlap below) shares that family's `fact` and draws
+# its own dims/measures/params from these SAME small pools -- e.g. up
+# to 150 different "USERS" analysts all choosing among only 3 possible
+# dimensions and however many attrs_of("SE_mysql.Users") returns as
+# measures. Deliberately small pools = deliberately high chance of
+# coincidental overlap between different analysts.
 FAMILIES = {
     "USERS": dict(fact="SE_mysql.Users",
                   dims_pool=["SE_mysql.postes", "SE_mysql.Votes", "SE_mongodb.Comments"],
@@ -44,6 +80,26 @@ FAMILIES = {
 
 def generate_events_overlap(seed, n_per_family, sessions_per_analyst=4,
                              dim_explore_prob=0.20, meas_explore_prob=0.15):
+    """For each family, spawn `n_per_family` synthetic analysts. Each
+    analyst FIRST picks a FIXED personal subset of the family's shared
+    pools (my_dims, my_measures, my_params below) -- this is what
+    preserves individual self-consistency (see the module docstring's
+    design note). Then, across `sessions_per_analyst` sessions, the
+    analyst mostly repeats that fixed personal choice, with a modest
+    chance each session of adding ONE extra "exploration" dimension
+    (dim_explore_prob) or measure (meas_explore_prob) drawn from the
+    REST of the family pool -- just enough session-to-session noise
+    that own-history isn't a trivially perfect (100% accuracy)
+    predictor, without destroying the underlying consistency that
+    makes own-history meaningful in the first place.
+
+    Because dims_pool/measures_pool are small (3 dims, however many
+    measures attrs_of() returns -- typically a handful) and SHARED by
+    every analyst in the family, many analysts will end up with
+    IDENTICAL my_dims/my_measures purely by the luck of random.sample()
+    -- that's the deliberate "engineered overlap" this experiment is
+    testing.
+    """
     events = []
     analysts = []
     sid = 0
@@ -53,6 +109,9 @@ def generate_events_overlap(seed, n_per_family, sessions_per_analyst=4,
             analysts.append(analyst_id)
             rng = random.Random(f"{seed}-{fam_name}-{rep}")
 
+            # --- Fixed personal subset, chosen ONCE per analyst (not
+            # per session) -- this is the individual-consistency
+            # anchor. ---
             n_dims_fixed = rng.randint(1, min(2, len(fam["dims_pool"])))
             my_dims = rng.sample(fam["dims_pool"], n_dims_fixed)
             n_meas_fixed = rng.randint(1, min(2, len(fam["measures_pool"])))
@@ -67,6 +126,11 @@ def generate_events_overlap(seed, n_per_family, sessions_per_analyst=4,
             for rnd in range(1, sessions_per_analyst + 1):
                 sid += 1
                 session = f"S{sid:05d}"
+                # The Fact is fixed by the family itself -- no
+                # per-analyst variation here, unlike
+                # build_usage_log.py's alt_fact mechanism. This keeps
+                # the "same fact, many analysts" overlap condition
+                # completely deterministic.
                 fact = fam["fact"]
                 events.append((session, analyst_id, rnd, "Dataset", fact, "F"))
 
@@ -87,6 +151,11 @@ def generate_events_overlap(seed, n_per_family, sessions_per_analyst=4,
                 for m in session_meas:
                     events.append((session, analyst_id, rnd, "Attribute", m, "M"))
 
+                # Parameters: use the analyst's fixed my_params for
+                # this dimension if it was set up above; otherwise
+                # (only possible for the occasional EXPLORED dimension,
+                # which has no pre-assigned my_params entry) fall back
+                # to that dimension's first few attributes directly.
                 for d in session_dims:
                     plist = my_params.get(d) or (attrs_of(d)[:3] or attrs_of(d))
                     if plist:
@@ -95,6 +164,15 @@ def generate_events_overlap(seed, n_per_family, sessions_per_analyst=4,
     return events, analysts
 
 # ---- shared machinery (same approach as scale_experiment.py) ----
+# Everything below this point is functionally identical to
+# scale_experiment.py's same-named functions (build_counts, cosine_sim,
+# ds_vec_fn, at_vec_fn, ndcg_at_k, rank_candidates, summarize, and the
+# fast approximate-leave-one-out pattern inside run_overlap). See
+# scale_experiment.py's comments for the full explanation of the
+# performance trade-off (full counts/similarity computed ONCE, then
+# approximated per-fold by decrementing just the held-out count) --
+# it's reproduced here verbatim because this script needs to remain
+# fully self-contained and runnable on its own.
 def build_counts(event_list, analysts):
     ds_counts = {a: {d: {'F': 0, 'D': 0} for d in DATASETS} for a in analysts}
     at_counts = {a: {x: {'M': 0, 'P': 0} for x in ATTRS} for a in analysts}
@@ -137,6 +215,10 @@ def ndcg_at_k(rank, k):
     return 1.0 / math.log2(rank + 1)
 
 def rank_candidates(candidates, own_lookup, others_lookup, sim_matrix, reference_items, strategy, rng):
+    """Same six strategies as scale_experiment.py / evaluate_v2.py
+    (random / popularity / own_only / others_only / similarity_only /
+    hybrid) -- see evaluate_extended.py's comments for the fullest
+    explanation of the ranking logic itself."""
     cand = list(candidates)
     if strategy == "random":
         rng.shuffle(cand)
@@ -171,12 +253,24 @@ def summarize(rows):
     return line
 
 def run_overlap(n_per_family, seed=42):
+    """Run the whole experiment for ONE family size: generate the
+    overlap-engineered log, evaluate all 6 strategies via the same
+    fast approximate leave-one-out as scale_experiment.py, and return
+    a summary dict. Called once per n_per_family value in the
+    `__main__` block at the bottom of this file."""
     events, analysts = generate_events_overlap(seed, n_per_family)
+    # Full (non-leave-one-out) counts/similarity, computed ONCE for
+    # the same performance reason as scale_experiment.py -- see that
+    # file's module docstring for the full explanation.
     full_ds_counts, full_at_counts = build_counts(events, analysts)
     sim_ds = cosine_sim(DATASETS, ds_vec_fn(full_ds_counts, analysts))
     sim_at = cosine_sim(ATTRS, at_vec_fn(full_at_counts, analysts))
 
     def build_fold_fast(idx):
+        """Approximate leave-one-out fold builder -- identical
+        technique to scale_experiment.py's build_fold_fast(): reuse
+        the full-log counts/similarity, and only correct own_lookup to
+        subtract 1 for the specific (candidate == truth) case."""
         sid, persona, rnd, itype, name, role = events[idx]
         ctx = [e for j, e in enumerate(events) if e[0] == sid and j != idx]
 
@@ -257,6 +351,11 @@ def run_overlap(n_per_family, seed=42):
     return out
 
 if __name__ == "__main__":
+    # Sweep four family sizes: 5, 20, 50, and 150 analysts PER family
+    # (so up to 4 x 150 = 600 total analysts at the largest scale) --
+    # printing P@1/NDCG@5 for every strategy at each scale, and
+    # writing the full sweep to a CSV (feeds the "Shared small pool"
+    # rows of the paper's Table `tab:scaleup`).
     rows = []
     for n_pf in [5, 20, 50, 150]:
         r = run_overlap(n_pf)
@@ -267,11 +366,11 @@ if __name__ == "__main__":
             s = r[strat]
             print(f"{strat:16s} {s['P@1']:>8.4f} {s['NDCG@5']:>8.4f}")
 
-    with open("/home/claude/overlap_experiment_results.csv", "w", newline="") as fh:
+    with open("./overlap_experiment_results.csv", "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["n_per_family", "n_analysts", "n_events", "n_folds", "strategy", "P@1", "NDCG@5"])
         for r in rows:
             for strat in STRATEGIES:
                 w.writerow([r["n_per_family"], r["n_analysts"], r["n_events"], r["n_folds"],
                             strat, r[strat]["P@1"], r[strat]["NDCG@5"]])
-    print("\nSaved /home/claude/overlap_experiment_results.csv")
+    print("\nSaved ./overlap_experiment_results.csv")

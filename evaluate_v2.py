@@ -1,4 +1,6 @@
 """
+evaluate_v2.py
+===============
 Evaluation v2 -- addresses three methodological weaknesses identified in review:
 
   FIX 1 (persona-level significance): the pooled fold-level Wilcoxon test in
@@ -22,6 +24,24 @@ Evaluation v2 -- addresses three methodological weaknesses identified in review:
 
 Outputs land in /home/claude/eval_v2_out/{standard,low_consistency}/ plus a
 top-level comparison and ablation report.
+
+WHICH PAPER TABLE EACH OUTPUT FEEDS:
+  - robustness_comparison.csv   -> Table `tab:robustness`
+  - ablation_standard.csv       -> the component-ablation numbers quoted in
+                                    the text and Figure `fig:ablation`
+  - ablation_low_consistency.csv -> the low-consistency ablation numbers
+                                     quoted alongside the standard ones
+  - significance_persona_level.csv (in each condition's subfolder)
+                                  -> the persona-level Wilcoxon p-values
+
+IMPORTANT: unlike build_usage_log.py, this script does NOT reuse the
+`events` list build_usage_log.py already generated on import. It has
+its OWN, self-contained event generator (generate_events, below),
+because it needs to generate the log TWICE with two different sets of
+noise probabilities (the "standard" and "low-consistency" conditions)
+-- something a single fixed `events` list can't do. It still imports
+PERSONAS/DATASETS/ATTRS/COLD/attrs_of from build_usage_log.py, so both
+scripts stay in sync on the persona definitions and polystore schema.
 """
 import random, math, os, csv
 import numpy as np
@@ -32,7 +52,7 @@ import matplotlib.pyplot as plt
 
 from build_usage_log import PERSONAS, DATASETS, ATTRS, COLD, attrs_of
 
-OUT_ROOT = "/home/claude/eval_v2_out"
+OUT_ROOT = "./eval_v2_out"
 os.makedirs(OUT_ROOT, exist_ok=True)
 
 K_VALUES = [1, 3, 5]
@@ -45,6 +65,17 @@ ANALYSTS = list(PERSONAS.keys()) + COLD
 # ------------------------------------------------------------- generation
 def generate_events(seed, sessions_per_persona=4, alt_fact_prob=0.15,
                      dim_alt_prob=0.25, explore_prob=0.10):
+    """A self-contained copy of build_usage_log.py's generation loop,
+    but PARAMETERIZED by the three noise probabilities (alt_fact_prob,
+    dim_alt_prob, explore_prob) so this script can call it twice with
+    different values -- once with the paper's standard 15%/25%/10%
+    (self-consistent personas), once with 50%/60%/40% (deliberately
+    noisy, low-consistency personas) for the robustness check. Each
+    call gets its OWN random.Random(seed) instance (not the global
+    `random` module), so calling this twice with the same seed but
+    different probabilities produces independent, reproducible runs
+    that don't interfere with each other's random-number stream.
+    """
     rng = random.Random(seed)
     events = []
     sid = 0
@@ -57,11 +88,18 @@ def generate_events(seed, sessions_per_persona=4, alt_fact_prob=0.15,
             sid += 1
             session = f"S{sid:03d}"
 
+            # --- FACT: usual fact, or (with alt_fact_prob probability)
+            # an alternate one. Same mechanic as build_usage_log.py,
+            # just with a caller-supplied probability instead of the
+            # hardcoded 0.15.
             fact = spec["fact"]
             if spec["alt_facts"] and rng.random() < alt_fact_prob:
                 fact = rng.choice(spec["alt_facts"])
             add(session, persona, rnd, "Dataset", fact, "F")
 
+            # --- DIMENSIONS: usual dims, optionally +1 extra explored
+            # dimension (dim_alt_prob probability), then pick a random
+            # non-empty subset of the resulting pool.
             dim_pool = list(spec["dims"])
             if spec["dim_alt"] and rng.random() < dim_alt_prob:
                 dim_pool = dim_pool + [rng.choice(spec["dim_alt"])]
@@ -84,12 +122,18 @@ def generate_events(seed, sessions_per_persona=4, alt_fact_prob=0.15,
             for m in chosen_meas:
                 add(session, persona, rnd, "Attribute", m, "M")
 
+            # --- PARAMETERS: one or more per chosen dimension, same
+            # pattern as build_usage_log.py.
             for d in chosen_dims:
                 plist = spec["params"].get(d, attrs_of(d)[:1])
                 n_p = min(len(plist), rng.randint(1, max(1, len(plist))))
                 for p in rng.sample(plist, n_p):
                     add(session, persona, rnd, "Attribute", p, "P")
 
+            # --- EXPLORATION NOISE: with explore_prob probability, add
+            # one extra Measure of the CURRENT fact's dataset. This is
+            # the knob that goes from 10% (standard) to 40%
+            # (low-consistency) between the two conditions.
             if rng.random() < explore_prob:
                 pool = attrs_of(fact)
                 if pool:
@@ -98,6 +142,12 @@ def generate_events(seed, sessions_per_persona=4, alt_fact_prob=0.15,
     return events
 
 # ------------------------------------------------------------- shared utilities
+# Everything from here to build_fold() is functionally identical to
+# evaluate_extended.py's same-named functions -- see that file's
+# comments for the full explanation of counts/similarity/leave-one-out
+# masking. Kept as a separate copy here (rather than importing from
+# evaluate_extended.py) so this script stays fully self-contained and
+# runnable on its own.
 def dataset_of_attr(attr):
     for d in DATASETS:
         if attr.startswith(d + "."):
@@ -105,6 +155,7 @@ def dataset_of_attr(attr):
     return None
 
 def build_counts(event_list):
+    """Per-analyst usage counts, same structure as evaluate_extended.py."""
     ds_counts = {a: {d: {'F': 0, 'D': 0} for d in DATASETS} for a in ANALYSTS}
     at_counts = {a: {x: {'M': 0, 'P': 0} for x in ATTRS} for a in ANALYSTS}
     for (sid, persona, rnd, itype, name, role) in event_list:
@@ -115,6 +166,7 @@ def build_counts(event_list):
     return ds_counts, at_counts
 
 def cosine_sim(items, vec_fn):
+    """Pairwise cosine similarity dict, same as evaluate_extended.py."""
     vecs = {it: vec_fn(it) for it in items}
     norms = {it: np.linalg.norm(v) for it, v in vecs.items()}
     sim = {}
@@ -141,6 +193,7 @@ def at_vec_fn(at_counts):
     return f
 
 def ndcg_at_k(rank, k):
+    """Single-relevant-item NDCG@k, same formula as evaluate_extended.py."""
     if rank is None or rank > k:
         return 0.0
     return 1.0 / math.log2(rank + 1)
@@ -149,6 +202,15 @@ def session_context(events_excl, sid):
     return [e for e in events_excl if e[0] == sid]
 
 def build_fold(events, idx):
+    """Build one leave-one-out fold from a GIVEN `events` list. Unlike
+    evaluate_extended.py's build_fold() (which always reads the single
+    module-level `events` from build_usage_log), this version takes
+    `events` as a parameter -- needed because THIS script generates
+    two different event lists (standard vs. low-consistency) and must
+    be able to build folds from either one on demand. The role-by-role
+    candidate/reference logic (F/D/M/P) is otherwise identical to
+    evaluate_extended.py's version -- see that file's comments for the
+    full per-role explanation."""
     held = events[idx]
     sid, persona, rnd, itype, name, role = held
     masked_events = events[:idx] + events[idx + 1:]
@@ -210,6 +272,33 @@ def build_fold(events, idx):
                 sim_matrix=sim_matrix, reference=reference)
 
 def rank_candidates(candidates, own_lookup, others_lookup, sim_matrix, reference_items, strategy, rng):
+    """Same ranking logic as evaluate_extended.py's rank_candidates,
+    EXCEPT this version adds the three ABLATION strategies that
+    evaluate_extended.py doesn't have -- each one isolates exactly ONE
+    of the three signals the hybrid strategy combines, so their
+    individual contribution can be measured:
+
+      - "own_only":        rank purely by the analyst's own usage
+                            count `own`. If the hybrid's advantage
+                            mostly survives with JUST this signal,
+                            that tells you own-history is doing most
+                            of the work.
+      - "others_only":     rank purely by other analysts' usage count
+                            `oth` -- functionally identical to
+                            "popularity", just given a name that makes
+                            its role in the ablation explicit.
+      - "similarity_only":  rank purely by cosine similarity `sim` to
+                            the fold's reference items, with NO usage
+                            counts at all -- isolates the structural/
+                            content-based signal on its own.
+      - "hybrid":           the full combined method (own, then oth,
+                            then sim, exactly as in
+                            evaluate_extended.py).
+
+    (Note: this version has no "knn" strategy -- that item-based
+    collaborative-filtering baseline was added later, in
+    evaluate_extended.py only.)
+    """
     cand = list(candidates)
     if strategy == "random":
         rng.shuffle(cand)
@@ -239,6 +328,10 @@ def rank_candidates(candidates, own_lookup, others_lookup, sim_matrix, reference
     return [c for _, c in scored]
 
 def build_folds(events):
+    """Build every evaluable leave-one-out fold for a GIVEN events
+    list (skipping COLD analysts' events, of which there are none, as
+    a defensive guard -- see the equivalent comment in
+    evaluate_extended.py)."""
     folds = []
     for i in range(len(events)):
         if events[i][1] in COLD:
@@ -249,6 +342,9 @@ def build_folds(events):
     return folds
 
 def run_strategies(folds, strategies, seed):
+    """Run every strategy in `strategies` on every fold, exactly like
+    evaluate_extended.py's main loop, but as a reusable function since
+    this script needs to call it twice (once per condition)."""
     results = []
     rngs = {s: random.Random(seed) for s in strategies}
     for f in folds:
@@ -267,6 +363,8 @@ def run_strategies(folds, strategies, seed):
 
 # ------------------------------------------------------------- summarizing
 def summarize(rows):
+    """Same aggregation as evaluate_extended.py's summarize(): mean
+    Precision/Recall/F1/NDCG at each k across a list of per-fold rows."""
     n = len(rows)
     line = {"n_folds": n}
     for k in K_VALUES:
@@ -289,7 +387,17 @@ def write_csv(rows, path):
 
 # ------------------------------------------------------------- FIX 1: persona-level significance
 def persona_level_test(results, strat_a, strat_b, k):
-    """Aggregate to one mean NDCG@k per persona per strategy, paired test on n=15 (or fewer)."""
+    """Aggregate to one mean NDCG@k per persona per strategy, paired
+    test on n=15 (or fewer). This is FIX 1 from the module docstring:
+    rather than treating every FOLD as an independent sample (which
+    inflates the sample size by pretending folds from the SAME persona
+    are unrelated), we first collapse each persona down to ONE mean
+    NDCG@k, then run both a Wilcoxon signed-rank test (non-parametric,
+    matches what's quoted in the paper) and a paired t-test (parametric
+    cross-check, reported alongside for transparency) on those 15
+    paired persona-level means. `n_nonzero_diffs` records how many of
+    the 15 persona pairs actually differ (ties don't inform the test),
+    which is diagnostic context worth keeping alongside the p-value."""
     personas = sorted(set(r["persona"] for r in results))
     a_vals, b_vals = [], []
     for p in personas:
@@ -304,6 +412,9 @@ def persona_level_test(results, strat_a, strat_b, k):
     try:
         w_stat, w_p = wilcoxon(a_vals, b_vals)
     except ValueError:
+        # Raised when every persona-level difference is exactly zero
+        # (nothing for the test to work with) -- report as "no result"
+        # rather than crashing.
         w_stat, w_p = float("nan"), float("nan")
     try:
         t_stat, t_p = ttest_rel(a_vals, b_vals)
@@ -316,6 +427,14 @@ def persona_level_test(results, strat_a, strat_b, k):
 
 # ------------------------------------------------------------- run one condition
 def run_condition(label, seed, alt_fact_prob, dim_alt_prob, explore_prob, sessions_per_persona=4):
+    """Run the FULL pipeline (generate -> build folds -> evaluate all
+    6 strategies -> summarize -> persona-level significance) for ONE
+    set of noise probabilities, writing everything to its own
+    subfolder under OUT_ROOT (e.g. eval_v2_out/standard/,
+    eval_v2_out/low_consistency/). Called twice below, once per
+    condition, with different (alt_fact_prob, dim_alt_prob,
+    explore_prob) triples -- that's the entire mechanism behind the
+    paper's "standard vs. low-consistency" robustness comparison."""
     out = f"{OUT_ROOT}/{label}"
     os.makedirs(out, exist_ok=True)
     events = generate_events(seed, sessions_per_persona, alt_fact_prob, dim_alt_prob, explore_prob)
@@ -346,13 +465,28 @@ def run_condition(label, seed, alt_fact_prob, dim_alt_prob, explore_prob, sessio
 
 # =============================================================== MAIN
 if __name__ == "__main__":
+    # Condition A: the paper's STANDARD condition -- same noise
+    # probabilities as build_usage_log.py's own defaults
+    # (15%/25%/10%), so this reproduces the main log's statistical
+    # behavior (though as an INDEPENDENTLY generated log -- this
+    # script's generate_events() is a separate copy, not a reuse of
+    # build_usage_log.py's own `events` list).
     print("=== Condition A: STANDARD (original, self-consistent personas) ===")
     standard = run_condition("standard", seed=42, alt_fact_prob=0.15, dim_alt_prob=0.25, explore_prob=0.10)
 
+    # Condition B: LOW-CONSISTENCY -- the same 15 personas and the
+    # same seed, but with every noise probability roughly tripled
+    # (50%/60%/40%). This directly tests the paper's robustness claim:
+    # does the hybrid method's advantage survive when analysts are
+    # much less predictable session-to-session?
     print("\n=== Condition B: LOW-CONSISTENCY (weakened persona self-consistency) ===")
     low = run_condition("low_consistency", seed=42, alt_fact_prob=0.50, dim_alt_prob=0.60, explore_prob=0.40)
 
     # ---------- FIX 2: robustness comparison table ----------
+    # Side-by-side P@1/NDCG@5 for hybrid vs. popularity (and random),
+    # in both conditions, plus the GAP between hybrid and popularity
+    # in each -- this table is exactly Table `tab:robustness` in the
+    # paper.
     comparison = []
     for cond in (standard, low):
         s_by = {s["strategy"]: s for s in cond["by_strategy"]}
@@ -367,6 +501,11 @@ if __name__ == "__main__":
     write_csv(comparison, f"{OUT_ROOT}/robustness_comparison.csv")
 
     # ---------- FIX 3: component ablation (on standard condition) ----------
+    # Pull just the four ABLATION_STRATEGIES rows (own_only,
+    # others_only, similarity_only, hybrid) out of each condition's
+    # full by_strategy summary, in a fixed, readable order -- these
+    # two CSVs are the direct source of the ablation numbers quoted in
+    # the paper's text and of Figure `fig:ablation`.
     ablation = [s for s in standard["by_strategy"] if s["strategy"] in ABLATION_STRATEGIES]
     order = {s: i for i, s in enumerate(ABLATION_STRATEGIES)}
     ablation.sort(key=lambda r: order[r["strategy"]])
@@ -377,6 +516,9 @@ if __name__ == "__main__":
     write_csv(ablation_low, f"{OUT_ROOT}/ablation_low_consistency.csv")
 
     # ---------- figures ----------
+    # Figure "robustness": grouped bars, one group per strategy, one
+    # bar per condition (standard vs. low-consistency) -- visualizes
+    # how much each strategy's P@1 degrades under noisier personas.
     fig, ax = plt.subplots(figsize=(6.5, 4))
     labels = ["Random", "Popularity", "Own-only", "Others-only", "Similarity-only", "Hybrid"]
     keys = ["random", "popularity", "own_only", "others_only", "similarity_only", "hybrid"]
@@ -392,6 +534,9 @@ if __name__ == "__main__":
     fig.savefig(f"{OUT_ROOT}/fig_robustness.png", dpi=200)
     plt.close(fig)
 
+    # Figure "ablation": for the STANDARD condition only, P@1 and
+    # NDCG@5 side by side for the four ablation strategies -- this is
+    # the exact PNG embedded in the paper as Figure `fig:ablation`.
     fig, ax = plt.subplots(figsize=(6, 4))
     abl_labels = ["Own-only", "Others-only", "Similarity-only", "Hybrid"]
     abl_p1 = [next(s["P@1"] for s in standard["by_strategy"] if s["strategy"] == k) for k in ABLATION_STRATEGIES]
@@ -407,6 +552,9 @@ if __name__ == "__main__":
     plt.close(fig)
 
     # ---------- readable summary ----------
+    # Same idea as evaluate_extended.py's results_readable.md: one
+    # consolidated Markdown report covering all three fixes, so
+    # nothing requires opening five separate CSVs to sanity-check.
     with open(f"{OUT_ROOT}/results_readable.md", "w") as fh:
         fh.write("# Evaluation v2 -- Persona-level significance, robustness, ablation\n\n")
 

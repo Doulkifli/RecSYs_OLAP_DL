@@ -1,8 +1,15 @@
 """
-Scaling experiment: does adding more data (more analysts sharing the same
-15 persona profiles) narrow the gap between own-history-only and
-collaborative ("others-only") ranking seen in the paper's component
-ablation (Section 6.3)?
+scale_experiment.py
+====================
+EXPLORATORY script, not part of the paper's main evaluation pipeline
+(evaluate_extended.py / evaluate_v2.py). Written to answer a reviewer-
+style question: "does adding more data (more analysts) reverse the
+finding that own-history dominates collaborative filtering?"
+
+Question this answers: does adding more data (more analysts sharing
+the same 15 persona profiles) narrow the gap between own-history-only
+and collaborative ("others-only") ranking seen in the paper's
+component ablation (Section 6.3)?
 
 Approach: replicate each of the 15 personas into N independent synthetic
 analyst instances (same fact/dims/measures/params spec, independent random
@@ -14,6 +21,27 @@ the paper's "future work" (10 to 1000 analysts) refers to.
 
 For each replication factor N in {1, 3, 10, 30}, we report P@1 / NDCG@5 for
 own_only, others_only, similarity_only, and hybrid.
+
+RESULT (feeds the paper's Table `tab:scaleup`, "Replicated personas" rows):
+the own-only/others-only gap narrows as N grows, then plateaus -- it never
+reverses, even at 30x replication (450 synthetic analysts).
+
+PERFORMANCE NOTE (why this file looks different from evaluate_extended.py):
+A naive port of evaluate_extended.py's leave-one-out approach -- fully
+rebuilding all counts and re-running cosine_sim from scratch for EVERY
+single fold -- runs out of memory once n_replicas reaches ~10 (150+
+analysts), because that rebuild is O(n_events) and gets repeated
+n_events times, i.e. O(n_events^2) total dictionary allocations. This
+script instead computes the FULL (non-leave-one-out) counts and
+similarity matrices ONCE, then approximates leave-one-out per fold by
+just subtracting 1 from the one count that fold's own held-out event
+contributed (see build_fold_fast / run_scale below for exactly how).
+This is exact for own/others usage counts, and a very close
+approximation for similarity (removing one event out of hundreds barely
+moves a cosine similarity), which is an acceptable trade-off for an
+exploratory sensitivity check -- it is NOT how the paper's main results
+were computed (those use the exact, fully-rebuilt leave-one-out from
+evaluate_extended.py / evaluate_v2.py).
 """
 import random, math, csv
 import numpy as np
@@ -23,6 +51,8 @@ K_VALUES = [1, 3, 5]
 STRATEGIES = ["random", "popularity", "own_only", "others_only", "similarity_only", "hybrid"]
 
 def dataset_of_attr(attr):
+    """Same as in the other scripts: recover an attribute's owning
+    dataset from its name prefix."""
     for d in DATASETS:
         if attr.startswith(d + "."):
             return d
@@ -30,6 +60,23 @@ def dataset_of_attr(attr):
 
 def generate_events_scaled(base_seed, n_replicas, sessions_per_persona=4,
                             alt_fact_prob=0.15, dim_alt_prob=0.25, explore_prob=0.10):
+    """Like build_usage_log.py's generation loop, but for EACH of the
+    15 personas, spawn `n_replicas` independent synthetic analysts
+    (IDs like "A1#0", "A1#1", ...) all sharing that persona's spec but
+    with their OWN random draws (a distinct random.Random seeded from
+    a string key "{base_seed}-{persona}-{rep}", so every replica is
+    reproducible and independent of every other replica/persona).
+    n_replicas=1 degenerates to plain analyst IDs (no "#0" suffix),
+    reproducing the ordinary 15-analyst log as the N=1 baseline point.
+
+    This is the mechanism behind the whole experiment: MORE replicas
+    of the SAME 15 profiles means MORE analysts who could plausibly
+    share an item choice by coincidence, which is exactly the
+    ingredient collaborative filtering needs to have a chance -- while
+    each individual analyst's OWN history length (4 sessions) never
+    changes, so own-history's predictive power isn't being helped by
+    this scaling axis at all.
+    """
     events = []
     analysts = []
     sid = 0
@@ -42,11 +89,14 @@ def generate_events_scaled(base_seed, n_replicas, sessions_per_persona=4,
                 sid += 1
                 session = f"S{sid:04d}"
 
+                # Fact (with occasional alt-fact exploration), same
+                # mechanic as build_usage_log.py / evaluate_v2.py.
                 fact = spec["fact"]
                 if spec["alt_facts"] and rng.random() < alt_fact_prob:
                     fact = rng.choice(spec["alt_facts"])
                 events.append((session, analyst_id, rnd, "Dataset", fact, "F"))
 
+                # Dimensions.
                 dim_pool = list(spec["dims"])
                 if spec["dim_alt"] and rng.random() < dim_alt_prob:
                     dim_pool = dim_pool + [rng.choice(spec["dim_alt"])]
@@ -55,6 +105,7 @@ def generate_events_scaled(base_seed, n_replicas, sessions_per_persona=4,
                 for d in chosen_dims:
                     events.append((session, analyst_id, rnd, "Dataset", d, "D"))
 
+                # Measures -- same fact-consistency fix as the other scripts.
                 if fact == spec["fact"]:
                     measures_pool = spec["measures"]
                 else:
@@ -63,12 +114,14 @@ def generate_events_scaled(base_seed, n_replicas, sessions_per_persona=4,
                 for m in rng.sample(measures_pool, n_meas):
                     events.append((session, analyst_id, rnd, "Attribute", m, "M"))
 
+                # Parameters, one set per chosen dimension.
                 for d in chosen_dims:
                     plist = spec["params"].get(d, attrs_of(d)[:1])
                     n_p = min(len(plist), rng.randint(1, max(1, len(plist))))
                     for p in rng.sample(plist, n_p):
                         events.append((session, analyst_id, rnd, "Attribute", p, "P"))
 
+                # Light exploration noise, same as the other scripts.
                 if rng.random() < explore_prob:
                     pool = attrs_of(fact)
                     if pool:
@@ -76,6 +129,10 @@ def generate_events_scaled(base_seed, n_replicas, sessions_per_persona=4,
     return events, analysts
 
 def build_counts(event_list, analysts):
+    """Per-analyst usage counts, parameterized by an explicit
+    `analysts` list (rather than a fixed global ANALYSTS constant, as
+    in the other scripts) since the analyst population here changes
+    size depending on n_replicas."""
     ds_counts = {a: {d: {'F': 0, 'D': 0} for d in DATASETS} for a in analysts}
     at_counts = {a: {x: {'M': 0, 'P': 0} for x in ATTRS} for a in analysts}
     for (sid, persona, rnd, itype, name, role) in event_list:
@@ -86,6 +143,7 @@ def build_counts(event_list, analysts):
     return ds_counts, at_counts
 
 def cosine_sim(items, vec_fn):
+    """Pairwise cosine similarity, identical formula to the other scripts."""
     vecs = {it: vec_fn(it) for it in items}
     norms = {it: np.linalg.norm(v) for it, v in vecs.items()}
     sim = {}
@@ -96,6 +154,9 @@ def cosine_sim(items, vec_fn):
     return sim
 
 def ds_vec_fn(ds_counts, analysts):
+    """Dataset usage vector across the given `analysts` list (its
+    length now depends on n_replicas, unlike the other scripts' fixed
+    17-analyst ANALYSTS list)."""
     def f(d):
         v = []
         for a in analysts:
@@ -119,7 +180,20 @@ def ndcg_at_k(rank, k):
 def session_context(events_excl, sid):
     return [e for e in events_excl if e[0] == sid]
 
+# NOTE: build_fold() below is the SLOW, exact leave-one-out version --
+# it is defined here for reference/completeness but NOT actually
+# called by run_scale() at the bottom of this file, which uses the
+# faster build_fold_fast() defined INSIDE run_scale() instead (see the
+# big comment at the top of this file for why). It's kept because it
+# documents, in the clearest form, exactly what the fast version is
+# approximating.
 def build_fold(events, idx, analysts):
+    """Exact (but slow at scale) leave-one-out fold construction:
+    fully removes events[idx] from the log and rebuilds counts +
+    similarity from scratch. Functionally identical to
+    evaluate_extended.py's build_fold(), just parameterized by an
+    explicit `analysts` list. See the module docstring for why
+    run_scale() below does NOT call this at n_replicas >= 10."""
     held = events[idx]
     sid, persona, rnd, itype, name, role = held
     masked_events = events[:idx] + events[idx + 1:]
@@ -180,6 +254,10 @@ def build_fold(events, idx, analysts):
                 reference=reference)
 
 def rank_candidates(candidates, own_lookup, others_lookup, sim_matrix, reference_items, strategy, rng):
+    """Same ranking logic as evaluate_v2.py's rank_candidates (random /
+    popularity / own_only / others_only / similarity_only / hybrid) --
+    see that file's comments for the full explanation of each
+    strategy."""
     cand = list(candidates)
     if strategy == "random":
         rng.shuffle(cand)
@@ -205,6 +283,9 @@ def rank_candidates(candidates, own_lookup, others_lookup, sim_matrix, reference
     return [c for _, c in scored]
 
 def summarize(rows):
+    """Mean Precision@k / NDCG@k across a list of per-fold rows --
+    same idea as the other scripts, just without Recall/F1 (not
+    needed for this exploratory check)."""
     n = len(rows)
     line = {"n_folds": n}
     for k in K_VALUES:
@@ -214,6 +295,11 @@ def summarize(rows):
     return line
 
 def run_scale(n_replicas, seed=42):
+    """Run the whole experiment for ONE replication factor: generate
+    the scaled-up log, evaluate all 6 strategies via the FAST
+    approximate leave-one-out (explained below), and return a summary
+    dict. Called once per n_replicas value in the `__main__` block at
+    the bottom of this file."""
     events, analysts = generate_events_scaled(seed, n_replicas)
     analysts_set = set(analysts)
 
@@ -231,7 +317,21 @@ def run_scale(n_replicas, seed=42):
     sim_at = cosine_sim(ATTRS, at_vec_fn(full_at_counts, analysts))
 
     def build_fold_fast(idx):
+        """The FAST fold builder actually used below. Instead of
+        rebuilding full_ds_counts/full_at_counts and re-running
+        cosine_sim from scratch for this one fold (what build_fold()
+        above does), it reuses the ALREADY-COMPUTED full-log counts
+        and similarity matrices, and only corrects `own_lookup` to
+        subtract 1 for the exact (candidate == truth) case -- i.e.
+        "pretend this one event never happened" is applied ONLY where
+        it actually matters (the analyst's own count for the specific
+        held-out item), not by literally reconstructing the whole
+        data structure each time."""
         sid, persona, rnd, itype, name, role = events[idx]
+        # Session context, built by scanning the WHOLE events list and
+        # excluding this fold's own index -- still O(n_events) per
+        # fold, but far cheaper than the full build_counts/cosine_sim
+        # rebuild that build_fold() would otherwise repeat.
         ctx = [e for j, e in enumerate(events) if e[0] == sid and j != idx]
 
         if itype == "Dataset":
@@ -247,6 +347,11 @@ def run_scale(n_replicas, seed=42):
             others_lookup = lambda c, _p=persona, _r=role: sum(
                 full_at_counts[a][c][_r] for a in analysts if a != _p)
 
+        # Candidate-pool / reference-item logic below is otherwise
+        # identical in spirit to build_fold() above and to
+        # evaluate_v2.py's build_fold(), just using the fast
+        # own_lookup/others_lookup closures defined just above instead
+        # of rebuilding fresh count dictionaries.
         if role == "F":
             candidates = list(DATASETS)
             reference = [d for d in DATASETS if own_lookup(d) > 0 or others_lookup(d) > 0]
@@ -311,6 +416,11 @@ def run_scale(n_replicas, seed=42):
     return out
 
 if __name__ == "__main__":
+    # Sweep four replication factors: 1 (the ordinary 15-analyst log,
+    # as a sanity-check baseline), 3, 10, and 30 (450 synthetic
+    # analysts) -- printing P@1/NDCG@5 for every strategy at each
+    # scale, and writing the full sweep to a CSV for later plotting or
+    # inclusion in the paper (Table `tab:scaleup`).
     rows = []
     for n_rep in [1, 3, 10, 30]:
         r = run_scale(n_rep)
@@ -321,7 +431,7 @@ if __name__ == "__main__":
             s = r[strat]
             print(f"{strat:16s} {s['P@1']:>8.4f} {s['NDCG@5']:>8.4f}")
 
-    with open("/home/claude/scale_experiment_results.csv", "w", newline="") as fh:
+    with open("./scale_experiment_results.csv", "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["n_replicas", "n_analysts", "n_events", "n_folds", "strategy", "P@1", "NDCG@5"])
         for r in rows:

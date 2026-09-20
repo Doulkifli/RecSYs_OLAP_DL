@@ -1,15 +1,53 @@
+"""
+build_usage_log.py
+===================
+Generates the seeded, deterministic, persona-driven SIMULATED usage log
+that stands in for organically-collected multi-analyst usage data
+(Section 6.1 of the paper). It also writes that log, plus derived
+count/similarity matrices, into an Excel workbook so a human reviewer
+can inspect it directly (open OLAP_Recommender_UsageLog.xlsx).
+
+High-level idea: we invent 15 "personas" (synthetic analysts), each with
+a fixed analytical habit (a typical Fact dataset, typical Dimensions,
+typical Measures, typical Dimension-Parameters), and let each persona
+run 4 simulated OLAP-cube-design sessions. Each session mostly repeats
+the persona's typical choices, with small amounts of randomness
+(occasionally picking an alternate fact, an extra dimension, an extra
+measure) so the log isn't perfectly deterministic/trivial.
+
+Output: a list of "events" -- one row per (session, analyst, item,
+role) selection -- which is exactly what the evaluation scripts
+(evaluate_extended.py, evaluate_v2.py) read via
+`from build_usage_log import events, ANALYSTS, DATASETS, ATTRS,
+PERSONAS, COLD, attrs_of`.
+"""
 import random, openpyxl
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, PatternFill, Alignment
 
+# Fixing the seed makes every run of this script byte-for-byte
+# reproducible: same personas + same seed = same log, always. This is
+# what "seed = 42" in the paper refers to.
 SEED = 42
 random.seed(SEED)
 
+# ---------------------------------------------------------------------
+# The polystore's candidate items. These mirror the actual StackExchange
+# polystore schema described in Section 5 (Implementation): 15 datasets
+# spread across the three stores (SE_mysql.*, SE_mongodb.*, SE_neo4j.*),
+# playing the role of candidate Facts/Dimensions in the recommender.
+# ---------------------------------------------------------------------
 DATASETS = ["SE_mysql.postes","SE_mysql.Posttypes","SE_mysql.Users","SE_mysql.Flagtypes",
     "SE_mysql.Votes","SE_mysql.Votetypes","SE_mongodb.Badges","SE_mongodb.Posts",
     "SE_mongodb.Users","SE_mongodb.Comments","SE_neo4j.postlinks","SE_neo4j.Posts",
     "SE_neo4j.Comments","SE_neo4j.Users","SE_neo4j.Tags"]
 
+# 63 candidate attributes ("dataset.AttributeName"), playing the role of
+# candidate Measures/Dimension-Parameters. Each attribute's owning
+# dataset is recoverable from its name prefix (see attrs_of/dataset_of
+# below) -- this naming convention is how the whole codebase knows
+# "which dataset does this attribute belong to" without a separate
+# lookup table.
 ATTRS = ["SE_mysql.postes.Id","SE_mysql.postes.PostTypeId","SE_mysql.postes.Title",
     "SE_mysql.postes.OwnerUserId","SE_mysql.postes.ViewCount","SE_mysql.postes.LastEditDate",
     "SE_mysql.postes.LastEditorUserId","SE_mysql.postes.CreationDate","SE_mysql.Posttypes.Id",
@@ -31,15 +69,45 @@ ATTRS = ["SE_mysql.postes.Id","SE_mysql.postes.PostTypeId","SE_mysql.postes.Titl
     "SE_neo4j.Tags.tagname","SE_neo4j.Tags.excerptpostid"]
 
 def attrs_of(ds):
+    """All attributes belonging to dataset `ds` (matched by name prefix
+    'ds.'). Used constantly: to build a persona's Measure/Parameter
+    pools, and by the evaluator to know which attributes are even
+    *candidates* for a given Fact/Dimension."""
     return [a for a in ATTRS if a.startswith(ds + ".")]
 
 def find(ds, substr):
+    """Convenience lookup used only while WRITING the PERSONAS table
+    below: 'give me the one attribute of dataset ds whose name contains
+    substr' (case-insensitive), e.g. find("SE_mysql.Users","Reputation")
+    -> "SE_mysql.Users.Reputation". Raises if no match, so a typo in a
+    persona definition fails loudly at import time instead of silently
+    producing an empty pool."""
     for a in attrs_of(ds):
         if substr.lower() in a.lower():
             return a
     raise ValueError(f"not found: {ds}.{substr}")
 
-# ---- Persona definitions: fact, alt_facts (occasional), dims, dim_alt, measures, params(per dim) ----
+# ---------------------------------------------------------------------
+# PERSONAS: the heart of the simulation. Each of the 15 keys (A1, A2,
+# ..., X2) is one synthetic analyst with a FIXED analytical habit:
+#   - cluster:    a thematic grouping label (A/B/C/D/E/X), not used by
+#                 the generation logic itself, just documentation/
+#                 grouping for humans reading this file.
+#   - fact:       the dataset this persona typically picks as OLAP Fact.
+#   - alt_facts:  dataset(s) this persona OCCASIONALLY picks instead of
+#                 `fact` (see the 15% branch below) -- models a bit of
+#                 realistic session-to-session variation.
+#   - dims:       the dataset(s) this persona typically picks as OLAP
+#                 Dimension(s).
+#   - dim_alt:    an occasional EXTRA dimension (see the 25% branch
+#                 below), added on top of `dims`, not a replacement.
+#   - measures:   this persona's typical Measure attribute(s) -- must
+#                 belong to `fact`'s dataset (find() enforces this by
+#                 construction, since it looks up attrs_of(fact)).
+#   - params:     a dict {dimension_dataset: [attribute, ...]} giving
+#                 this persona's typical Dimension-Parameter(s) for
+#                 each of its dims.
+# ---------------------------------------------------------------------
 PERSONAS = {
  "A1": dict(cluster="A", fact="SE_mysql.Users",
     alt_facts=["SE_mysql.postes"],
@@ -125,37 +193,73 @@ PERSONAS = {
             "SE_mysql.postes":[find("SE_mysql.postes","Id")]}),
 }
 
-# Two deliberately near-empty analysts for the cold-start subset (Sec. 6.4)
+# COLD1/COLD2: two placeholder analyst IDs that get NO events at all
+# (they simply never appear in the generation loop below). They exist
+# purely so the evaluation scripts have two "genuinely zero-history"
+# analysts to exercise the pure metadata-fallback / cold-start code
+# path (Section 6.4 of the paper), as opposed to the 15 personas who
+# always have at least some history.
 COLD = ["COLD1", "COLD2"]
 
 SESSIONS_PER_PERSONA = 4
+# Every analyst ID the evaluation scripts will build count-matrices
+# over -- the 15 personas plus the 2 (event-less) cold-start IDs.
 ANALYSTS = list(PERSONAS.keys()) + COLD
 
-events = []  # (session_id, persona, round_no, item_type, item_name, role)
+events = []  # each entry: (session_id, persona, round_no, item_type, item_name, role)
 sid = 0
 
 def add(session, persona, rnd, itype, name, role):
+    """Tiny helper so every event-append below reads as one line
+    instead of repeating events.append((...)) everywhere."""
     events.append((session, persona, rnd, itype, name, role))
 
+# ---------------------------------------------------------------------
+# THE GENERATION LOOP: for every persona, run SESSIONS_PER_PERSONA=4
+# independent "OLAP cube design sessions". Each session produces
+# exactly one Fact event, 1+ Dimension events, 1+ Measure events, and
+# 1+ Parameter event(s) per chosen dimension -- mirroring what a real
+# analyst does when building a cube (pick a fact, pick dimensions,
+# pick measures, pick how to slice each dimension).
+# ---------------------------------------------------------------------
 for persona, spec in PERSONAS.items():
     for rnd in range(1, SESSIONS_PER_PERSONA + 1):
         sid += 1
         session = f"S{sid:03d}"
 
+        # --- FACT ---
+        # 85% of the time: the persona's usual fact. 15% of the time
+        # (only if alt_facts is non-empty): explore an alternate fact
+        # instead. This is what makes the log non-trivial -- without
+        # it, "own-history-only" ranking would be a perfect predictor
+        # every single time.
         fact = spec["fact"]
         if spec["alt_facts"] and random.random() < 0.15:
             fact = random.choice(spec["alt_facts"])
         add(session, persona, rnd, "Dataset", fact, "F")
 
-        # Measures must belong to whichever dataset was actually chosen as fact.
-        # (Bug fix: previously spec["measures"] was used unconditionally, which
-        # are tied to spec["fact"] -- so an alt_fact session recorded a Measure
-        # for a dataset different from the Fact it was supposed to belong to.)
+        # --- MEASURE POOL SELECTION (bug fix lives here) ---
+        # Measures must belong to whichever dataset was actually chosen
+        # as fact THIS session. If we always used spec["measures"]
+        # (which are tied to spec["fact"], the persona's DEFAULT fact),
+        # then an alt_fact session would record a Measure belonging to
+        # a different dataset than the Fact actually picked above --
+        # silently violating the intended invariant "every Fact
+        # selection has at least one Measure on the same dataset".
+        # Fix: when the alt-fact branch fired, fall back to that
+        # fact's OWN attributes (attrs_of(fact)) instead of the
+        # persona's default measure list.
         if fact == spec["fact"]:
             measures_pool = spec["measures"]
         else:
             measures_pool = attrs_of(fact) or spec["measures"]
 
+        # --- DIMENSIONS ---
+        # Start from the persona's usual dimension(s). 25% of the time
+        # (if dim_alt is non-empty), ADD one extra "exploration"
+        # dimension on top (not a replacement, unlike the fact branch
+        # above). Then randomly choose how many of the resulting pool
+        # to actually use this session (at least 1).
         dim_pool = list(spec["dims"])
         if spec["dim_alt"] and random.random() < 0.25:
             dim_pool = dim_pool + [random.choice(spec["dim_alt"])]
@@ -164,18 +268,33 @@ for persona, spec in PERSONAS.items():
         for d in chosen_dims:
             add(session, persona, rnd, "Dataset", d, "D")
 
+        # --- MEASURES ---
+        # Same "choose a random-size subset" pattern, but drawing from
+        # measures_pool (the fact-consistent pool computed above).
         n_meas = min(len(measures_pool), random.randint(1, max(1, len(measures_pool))))
         chosen_meas = random.sample(measures_pool, n_meas)
         for m in chosen_meas:
             add(session, persona, rnd, "Attribute", m, "M")
 
+        # --- PARAMETERS ---
+        # For EVERY dimension chosen this session, record 1+ Parameter
+        # attribute(s) belonging to that dimension's dataset. Uses the
+        # persona's declared params for that dimension if present,
+        # otherwise falls back to that dimension's first attribute
+        # (attrs_of(d)[:1]) as a safe default so no dimension is ever
+        # left without a parameter.
         for d in chosen_dims:
             plist = spec["params"].get(d, attrs_of(d)[:1])
             n_p = min(len(plist), random.randint(1, max(1, len(plist))))
             for p in random.sample(plist, n_p):
                 add(session, persona, rnd, "Attribute", p, "P")
 
-        # light exploratory noise: occasionally touch one extra attribute of the fact dataset
+        # --- LIGHT EXPLORATION NOISE ---
+        # 10% chance of touching one extra Measure attribute of the
+        # fact dataset, on top of the "normal" measures above. Purely
+        # adds a bit more realistic noise to the log; does not affect
+        # the Fact->Measure invariant since it draws from attrs_of(fact)
+        # (the CURRENT session's fact), same safety as the fix above.
         if random.random() < 0.10:
             pool = attrs_of(fact)
             if pool:
@@ -183,7 +302,13 @@ for persona, spec in PERSONAS.items():
 
 print(f"Generated {len(events)} events across {sid} sessions, {len(PERSONAS)} personas.")
 
-# ---------------- Build workbook ----------------
+# =======================================================================
+# EVERYTHING BELOW THIS LINE writes the same `events` list into an Excel
+# workbook, purely so a human can open it and inspect the log directly.
+# It does not affect the evaluation scripts, which import `events`
+# straight from Python (the code above) -- the workbook is a reporting
+# artifact, not the source of truth.
+# =======================================================================
 wb = openpyxl.Workbook()
 FONT = "Calibri"
 HEAD_FILL = PatternFill("solid", fgColor="1F3864")
@@ -191,13 +316,19 @@ HEAD_FONT = Font(name=FONT, bold=True, color="FFFFFF", size=10)
 CELL_FONT = Font(name=FONT, size=10)
 
 def style_header(ws, ncols, row=1):
+    """Bold white-on-navy header row + centered wrapped text, applied
+    to every sheet below for a consistent look."""
     for c in range(1, ncols + 1):
         cell = ws.cell(row=row, column=c)
         cell.fill = HEAD_FILL
         cell.font = HEAD_FONT
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-# --- Sheet 1: SessionLog ---
+# --- Sheet 1: SessionLog -- the raw event list, one row per event ---
+# This is the literal ground truth: every other sheet in the workbook
+# is DERIVED from this one via spreadsheet formulas (not hardcoded),
+# so opening the workbook and editing a row here would ripple through
+# to the Datasets/Attributs/Similarity sheets automatically.
 ws_log = wb.active
 ws_log.title = "SessionLog"
 ws_log.append(["SessionID", "Persona", "Round", "ItemType", "ItemName", "Role"])
@@ -209,9 +340,15 @@ for col, w in zip("ABCDEF", [10, 10, 8, 12, 34, 8]):
 ws_log.freeze_panes = "A2"
 
 n_events = len(events)
-LOG_LAST = n_events + 1  # last data row in SessionLog
+LOG_LAST = n_events + 1  # last data row in SessionLog (row 1 is the header)
 
-# --- Sheet 2: Datasets (aggregated via COUNTIFS formulas) ---
+# --- Sheet 2: Datasets -- per-analyst Fact/Dimension usage COUNTS ---
+# One row per analyst, two columns per dataset ("(F)" count, "(D)"
+# count). Every cell is a COUNTIFS formula over SessionLog, e.g.
+# "how many times did this analyst use this exact dataset in the Fact
+# role?" -- this is exactly the ds_counts[persona][dataset]['F'] /
+# ['D'] structure the evaluation scripts build in Python, just
+# expressed as spreadsheet formulas here for human inspection.
 ws_ds = wb.create_sheet("Datasets")
 header = ["Analyste"]
 for d in DATASETS:
@@ -237,7 +374,8 @@ ws_ds.freeze_panes = "B2"
 N_AN = len(ANALYSTS)
 DS_FIRST_ROW, DS_LAST_ROW = 2, 1 + N_AN
 
-# --- Sheet 3: Attributs (aggregated via COUNTIFS formulas) ---
+# --- Sheet 3: Attributs -- same idea, but per-analyst Measure/Parameter
+# usage counts for every attribute (mirrors at_counts in Python). ---
 ws_at = wb.create_sheet("Attributs")
 header2 = ["Analyste"]
 for a in ATTRS:
@@ -262,7 +400,14 @@ ws_at.freeze_panes = "B2"
 
 AT_FIRST_ROW, AT_LAST_ROW = 2, 1 + N_AN
 
-# --- Sheet 4: Similarity_Datasets (cosine similarity via SUMPRODUCT/SUMSQ) ---
+# --- Sheet 4: Similarity_Datasets -- a 15x15 cosine-similarity matrix
+# between datasets, computed directly from the Datasets sheet. ---
+# For each pair (di, dj), cosine similarity = dot-product of their
+# usage vectors (F-count, D-count across all analysts) divided by the
+# product of their vector norms. Written here as raw SUMPRODUCT/SUMSQ
+# spreadsheet formulas rather than a Python computation, so the
+# workbook is self-contained and re-derives everything from SessionLog
+# alone if you edit a raw event by hand.
 ws_sd = wb.create_sheet("Similarity_Datasets")
 ws_sd.cell(row=1, column=1, value="")
 for j, d in enumerate(DATASETS, start=2):
@@ -280,6 +425,10 @@ for c in range(2, len(DATASETS) + 2):
     ws_sd.column_dimensions[get_column_letter(c)].width = 12
 
 def ds_cols(idx):
+    """Given a dataset's position `idx` in DATASETS, return the two
+    Excel column letters (F-count, D-count) holding its usage vector
+    in the Datasets sheet -- each dataset occupies 2 consecutive
+    columns there, starting at column B (index 2)."""
     f_col = 2 + 2 * idx
     return get_column_letter(f_col), get_column_letter(f_col + 1)
 
@@ -287,17 +436,24 @@ for i, di in enumerate(DATASETS):
     fi, dii = ds_cols(i)
     for j, dj in enumerate(DATASETS):
         fj, dj_ = ds_cols(j)
+        # dot-product across BOTH the F-count and D-count sub-vectors
         dot = (f'SUMPRODUCT(Datasets!${fi}${DS_FIRST_ROW}:${fi}${DS_LAST_ROW},Datasets!${fj}${DS_FIRST_ROW}:${fj}${DS_LAST_ROW})'
                f'+SUMPRODUCT(Datasets!${dii}${DS_FIRST_ROW}:${dii}${DS_LAST_ROW},Datasets!${dj_}${DS_FIRST_ROW}:${dj_}${DS_LAST_ROW})')
+        # ||di|| and ||dj|| (Euclidean norm of each dataset's usage vector)
         normi = (f'SQRT(SUMSQ(Datasets!${fi}${DS_FIRST_ROW}:${fi}${DS_LAST_ROW})'
                  f'+SUMSQ(Datasets!${dii}${DS_FIRST_ROW}:${dii}${DS_LAST_ROW}))')
         normj = (f'SQRT(SUMSQ(Datasets!${fj}${DS_FIRST_ROW}:${fj}${DS_LAST_ROW})'
                  f'+SUMSQ(Datasets!${dj_}${DS_FIRST_ROW}:${dj_}${DS_LAST_ROW}))')
+        # cos(theta) = dot / (||di|| * ||dj||); IFERROR guards against a
+        # brand-new/never-used dataset having a zero-length vector,
+        # which would otherwise divide by zero.
         formula = f'=IFERROR(({dot})/(({normi})*({normj})),0)'
         ws_sd.cell(row=2 + i, column=2 + j, value=formula).font = CELL_FONT
 ws_sd.freeze_panes = "B2"
 
-# --- Sheet 5: Similarity_Attributs (cosine similarity via SUMPRODUCT/SUMSQ) ---
+# --- Sheet 5: Similarity_Attributs -- the same cosine-similarity
+# construction as Sheet 4, but a 63x63 matrix over ATTRS using their
+# (M-count, P-count) usage vectors from the Attributs sheet. ---
 ws_sa = wb.create_sheet("Similarity_Attributs")
 for j, a in enumerate(ATTRS, start=2):
     ws_sa.cell(row=1, column=j, value=a)
@@ -314,6 +470,8 @@ for c in range(2, len(ATTRS) + 2):
     ws_sa.column_dimensions[get_column_letter(c)].width = 10
 
 def at_cols(idx):
+    """Same idea as ds_cols() above, but for the Attributs sheet's
+    (M-count, P-count) column pairs."""
     m_col = 2 + 2 * idx
     return get_column_letter(m_col), get_column_letter(m_col + 1)
 
@@ -331,7 +489,9 @@ for i, ai in enumerate(ATTRS):
         ws_sa.cell(row=2 + i, column=2 + j, value=formula).font = CELL_FONT
 ws_sa.freeze_panes = "B2"
 
-# --- Sheet 6: README ---
+# --- Sheet 6: README -- plain-text documentation embedded IN the
+# workbook itself, so it's self-explanatory even if separated from
+# this .py file. Mirrors the docstring at the top of this file. ---
 ws_r = wb.create_sheet("README")
 ws_r.column_dimensions["A"].width = 110
 lines = [
@@ -370,5 +530,5 @@ for i, line in enumerate(lines, start=1):
     c = ws_r.cell(row=i, column=1, value=line)
     c.font = Font(name=FONT, size=11, bold=(i == 1))
 
-wb.save("/home/claude/OLAP_Recommender_UsageLog.xlsx")
+wb.save("./OLAP_Recommender_UsageLog.xlsx")
 print("saved")
