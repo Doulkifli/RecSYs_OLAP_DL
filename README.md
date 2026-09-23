@@ -1,4 +1,4 @@
-# Reproducibility package — OLAP Dataset/Attribute Recommender (Information, MDPI)
+# Reproducibility package — OLAP Dataset/Attribute Recommender 
 
 This folder contains the three seeded, deterministic Python scripts behind
 every number and figure reported in the paper's evaluation section
